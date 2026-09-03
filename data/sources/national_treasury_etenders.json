@@ -1,0 +1,30 @@
+{
+  "sources": [
+    {
+      "name": "National Treasury eTenders (OCDS Release API)",
+      "organization": "National Treasury of South Africa",
+      "slug": "national-treasury-etenders-ocds",
+      "source_type": "NATIONAL_ETENDER",
+      "connector_type": "CUSTOM",
+      "connector_key": "custom.etender_ocds",
+      "base_url": "https://ocds-api.etenders.gov.za",
+      "procurement_scope": "NATIONAL",
+      "config": {
+        "listing_paths": [
+          "/api/OCDSReleases?PageNumber=1&PageSize=200&dateFrom={date_from}&dateTo={date_to}"
+        ],
+        "lookback_days": 30,
+        "releases_path": "releases",
+        "next_link_path": "links.next",
+        "max_pages": 25
+      },
+      "enabled": true,
+      "priority": 10,
+      "crawl_frequency_minutes": 360,
+      "rate_limit_per_minute": 30,
+      "robots_policy": "RESPECT",
+      "verified_at": "2026-09-03T00:00:00Z",
+      "notes": "Verified 2026-09-03 against the publisher's swagger document and a live response. OCDS 1.1 release packages, PDDL 1.0 licence. dateFrom/dateTo are mandatory - the {date_from}/{date_to} placeholders resolve to a rolling 30-day window at each run. Pagination follows links.next. PageSize is capped at 1000 for browser clients; 200 keeps responses small and the 25-page cap covers ~5000 releases per window."
+    }
+  ]
+}
