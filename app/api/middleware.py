@@ -39,8 +39,35 @@ SECURITY_HEADERS = {
     "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
 }
 
+#: Swagger UI and ReDoc are the one part of this service that is a *web page*
+#: rather than JSON, and both load their bundle from jsDelivr. The default
+#: ``default-src 'none'`` policy is right for every API response and fatal for
+#: these two: the browser fetches the document, blocks the scripts, and renders
+#: a blank page with no visible error. They therefore get a narrowly widened
+#: policy — the CDN for scripts and styles, ``data:`` for the favicon and
+#: ReDoc's inline worker — and nothing else.
+DOCS_CSP = (
+    "default-src 'none'; "
+    "script-src 'self' https://cdn.jsdelivr.net 'unsafe-inline'; "
+    "style-src 'self' https://cdn.jsdelivr.net 'unsafe-inline'; "
+    "img-src 'self' data: https://fastapi.tiangolo.com; "
+    "font-src 'self' https://cdn.jsdelivr.net; "
+    "worker-src 'self' blob:; "
+    "connect-src 'self'"
+)
+
 #: Probes would dominate the log and carry no information.
 QUIET_PATHS = ("/health", "/health/live", "/health/ready", "/metrics")
+
+
+def _is_docs_path(path: str) -> bool:
+    """True for the interactive documentation pages (not ``/openapi.json``).
+
+    Matched by suffix rather than against a fixed string because ``API_PREFIX``
+    is configurable, and the schema document itself is excluded: it is JSON and
+    keeps the strict policy.
+    """
+    return path.rstrip("/").endswith(("/docs", "/redoc"))
 
 
 class RequestContextMiddleware(BaseHTTPMiddleware):
@@ -87,6 +114,8 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         response.headers[REQUEST_ID_HEADER] = request_id
         for header, value in SECURITY_HEADERS.items():
             response.headers.setdefault(header, value)
+        if _is_docs_path(request.url.path):
+            response.headers["Content-Security-Policy"] = DOCS_CSP
 
         # Rate-limit headers are attached centrally: the limiter runs inside an
         # auth dependency, so a route that forgets them still reports correctly.
