@@ -196,3 +196,137 @@ async def test_paths_without_placeholders_are_left_alone() -> None:
     source.config = {"listing_paths": ["/api/OCDSReleases?dateFrom=2026-01-01&dateTo=2026-02-01"]}
     url = (await ETenderOCDSConnector().discover(source))[0].url
     assert url.endswith("/api/OCDSReleases?dateFrom=2026-01-01&dateTo=2026-02-01")
+
+
+class _StubFetcher:
+    """Serves canned pages so the pagination walk can be tested offline."""
+
+    def __init__(self, pages: dict[str, dict]) -> None:
+        self.pages = pages
+        self.calls: list[str] = []
+
+    async def fetch(self, url, *, source=None, target=None, headers=None):
+        self.calls.append(url)
+        from app.connectors.base import DiscoveryTarget
+
+        return FetchResult(
+            url=url,
+            status_code=200,
+            content=json.dumps(self.pages[url]).encode(),
+            headers={"content-type": "application/json"},
+            target=target or DiscoveryTarget(url=url, kind="listing"),
+        )
+
+
+def _release(ocid: str, title: str) -> dict:
+    return {
+        "ocid": ocid,
+        "id": f"{ocid}-2026-09-03",
+        "date": "2026-09-03T00:00:00Z",
+        "tender": {
+            "id": ocid.split("-")[-1],
+            "title": title,
+            "status": "active",
+            "tenderPeriod": {"endDate": "2026-09-30T11:00:00Z"},
+            "procurementMethodDetails": "Open Tender",
+        },
+        "buyer": {"id": "1", "name": "Test Buyer"},
+    }
+
+
+def _page(releases: list[dict], next_url: str | None) -> dict:
+    payload: dict = {"version": "1.1", "releases": releases}
+    if next_url:
+        payload["links"] = {"next": next_url}
+    return payload
+
+
+async def _run_with(pages: dict[str, dict], config: dict) -> tuple[list, _StubFetcher]:
+    source = _source()
+    source.config = config
+    connector = ETenderOCDSConnector()
+    fetcher = _StubFetcher(pages)
+    connector.fetcher = fetcher  # type: ignore[assignment]
+    items = [item async for item in connector.run(source)]
+    return items, fetcher
+
+
+P1 = "https://ocds-api.etenders.gov.za/api/OCDSReleases?PageNumber=1"
+P2 = "https://ocds-api.etenders.gov.za/api/OCDSReleases?PageNumber=2"
+P3 = "https://ocds-api.etenders.gov.za/api/OCDSReleases?PageNumber=3"
+
+
+async def test_pagination_follows_links_next_to_the_end() -> None:
+    """A single date window spans many pages; page 1 alone silently loses data."""
+    pages = {
+        P1: _page([_release("ocds-a-1", "Page one tender")], P2),
+        P2: _page([_release("ocds-b-2", "Page two tender")], P3),
+        P3: _page([_release("ocds-c-3", "Page three tender")], None),
+    }
+    items, fetcher = await _run_with(pages, {"listing_paths": ["/api/OCDSReleases?PageNumber=1"]})
+    assert [i.fields["title"] for i in items] == [
+        "Page one tender",
+        "Page two tender",
+        "Page three tender",
+    ]
+    assert fetcher.calls == [P1, P2, P3]
+
+
+async def test_pagination_stops_at_max_pages() -> None:
+    pages = {
+        P1: _page([_release("ocds-a-1", "One")], P2),
+        P2: _page([_release("ocds-b-2", "Two")], P3),
+        P3: _page([_release("ocds-c-3", "Three")], None),
+    }
+    items, fetcher = await _run_with(
+        pages, {"listing_paths": ["/api/OCDSReleases?PageNumber=1"], "max_pages": 2}
+    )
+    assert len(items) == 2
+    assert fetcher.calls == [P1, P2]
+
+
+async def test_self_referential_cursor_does_not_loop_forever() -> None:
+    """A cursor pointing back at a fetched page must terminate the walk."""
+    pages = {P1: _page([_release("ocds-a-1", "Only")], P1)}
+    items, fetcher = await _run_with(pages, {"listing_paths": ["/api/OCDSReleases?PageNumber=1"]})
+    assert len(items) == 1
+    assert fetcher.calls == [P1]
+
+
+async def test_missing_next_link_ends_cleanly() -> None:
+    pages = {P1: _page([_release("ocds-a-1", "Only")], None)}
+    items, fetcher = await _run_with(pages, {"listing_paths": ["/api/OCDSReleases?PageNumber=1"]})
+    assert len(items) == 1
+    assert fetcher.calls == [P1]
+
+
+async def test_max_pages_is_clamped_and_defaulted() -> None:
+    source = _source()
+    connector = ETenderOCDSConnector()
+    source.config = {}
+    assert connector._max_pages(source) == 5
+    source.config = {"max_pages": 0}
+    assert connector._max_pages(source) == 1
+    source.config = {"max_pages": "junk"}
+    assert connector._max_pages(source) == 5
+
+
+async def test_releases_path_is_honoured() -> None:
+    """The documented releases_path option was previously ignored."""
+    source = _source()
+    source.config = {
+        "listing_paths": ["/api/OCDSReleases"],
+        "releases_path": "data.records",
+    }
+    connector = ETenderOCDSConnector()
+    target = (await connector.discover(source))[0]
+    payload = {"data": {"records": [_release("ocds-x-9", "Nested tender")]}}
+    response = FetchResult(
+        url=target.url,
+        status_code=200,
+        content=json.dumps(payload).encode(),
+        headers={},
+        target=target,
+    )
+    items = await connector.parse(source, response)
+    assert [i.fields["title"] for i in items] == ["Nested tender"]

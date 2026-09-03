@@ -68,7 +68,7 @@ Known limitations
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from datetime import timedelta
 from typing import Any
 
@@ -213,7 +213,11 @@ class ETenderOCDSConnector(ProcurementConnector):
                 "eTender response was not valid JSON", details={"url": response.url}
             ) from exc
 
-        releases = payload.get("releases") if isinstance(payload, dict) else payload
+        releases = (
+            _dig(payload, str(source.get("releases_path", "releases")))
+            if isinstance(payload, dict)
+            else payload
+        )
         if isinstance(releases, dict):
             releases = [releases]
         if not isinstance(releases, list):
@@ -229,6 +233,65 @@ class ETenderOCDSConnector(ProcurementConnector):
             if item is not None:
                 items.append(item)
         return items
+
+    async def run(self, source: SourceContext) -> AsyncIterator[RawItem]:
+        """Driver that follows the feed's ``links.next`` cursor.
+
+        The base driver fetches each discovered target exactly once. This feed
+        returns a single date window across many pages — verified 2026-09-03,
+        where a 30-day window produced 95 releases on page 1 and more beyond it
+        — so without following the cursor every run would silently collect only
+        the first page and look perfectly healthy while dropping the remainder.
+
+        ``max_pages`` bounds the walk; the visited-set and same-URL check stop a
+        self-referential cursor from looping forever.
+        """
+        max_pages = self._max_pages(source)
+        next_path = str(source.get("next_link_path", "links.next"))
+
+        for target in await self.discover(source):
+            page_url: str | None = target.url
+            visited: set[str] = set()
+            pages = 0
+
+            while page_url and pages < max_pages:
+                visited.add(page_url)
+                response = await self.fetch(source, DiscoveryTarget(url=page_url, kind=target.kind))
+                pages += 1
+
+                for item in await self.parse(source, response):
+                    if await self.validate(source, item):
+                        item.documents = list(await self.extract_documents(source, item))
+                        yield item
+
+                page_url = self._next_page(response, next_path, visited)
+
+    def _next_page(self, response: FetchResult, next_path: str, visited: set[str]) -> str | None:
+        """Resolve the next-page URL, or ``None`` to stop."""
+        try:
+            payload = json.loads(response.text)
+        except ValueError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+
+        candidate = _dig(payload, next_path)
+        if not isinstance(candidate, str) or not candidate.strip():
+            return None
+        try:
+            absolute = normalize_url(candidate, base=response.url)
+        except Exception:  # noqa: BLE001
+            return None
+        # A cursor pointing at a page already fetched means the publisher has
+        # stopped advancing; treat it as the end rather than looping.
+        return None if absolute in visited else absolute
+
+    def _max_pages(self, source: SourceContext) -> int:
+        try:
+            pages = int(source.get("max_pages", 5))
+        except (TypeError, ValueError):
+            return 5
+        return min(max(pages, 1), 500)
 
     def _map_release(
         self, source: SourceContext, response: FetchResult, release: dict[str, Any]
@@ -432,6 +495,18 @@ def _filename_from_query(url: str) -> str | None:
             if value and _looks_like_filename(value):
                 return value.replace("/", "_").replace("\\", "_")
     return None
+
+
+def _dig(payload: dict[str, Any], path: str) -> Any:
+    """Read a dotted path (``links.next``) out of a nested mapping."""
+    current: Any = payload
+    for part in path.split("."):
+        if not isinstance(current, dict):
+            return None
+        current = current.get(part)
+        if current is None:
+            return None
+    return current
 
 
 def _party(parties: list[Any], role: str) -> dict[str, Any] | None:
