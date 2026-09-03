@@ -1,0 +1,242 @@
+# TenderBase API — continuous integration.
+#
+# Three jobs, ordered by how fast they fail:
+#
+#   * `static`  — ruff and mypy. Seconds, no services, catches most mistakes.
+#   * `test`    — the full pytest suite against real PostgreSQL and Redis, so the
+#                 31 specs that skip on a laptop (pg_trgm dedup, full-text
+#                 ranking, ARQ queue behaviour) actually execute here. CI is the
+#                 only place they run, which is precisely why this job exists.
+#   * `docker`  — builds the production image. The Dockerfile was written but
+#                 never built; an unbuilt Dockerfile is a broken one waiting to
+#                 be discovered during an incident.
+#
+# The suite is *also* run on SQLite, because that is the default a contributor
+# gets locally: if SQLite mode breaks, everyone's inner loop breaks, and only a
+# matrix catches dialect assumptions leaking into shared tests.
+
+name: CI
+
+on:
+  push:
+    branches: ["main", "arena/**"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+# A new push to the same branch makes the previous run irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+  # The suite never reads a real secret, but Settings refuses to construct
+  # without one — that refusal is deliberate, so CI supplies an obvious fake.
+  SECRET_KEY: ci-secret-key-not-a-real-secret
+  APP_ENV: test
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  static:
+    name: Lint, format and types
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: ruff check
+        run: ruff check --output-format=github .
+
+      - name: ruff format --check
+        run: ruff format --check .
+
+      - name: mypy
+        run: mypy app
+
+  # ---------------------------------------------------------------------------
+  test:
+    name: Tests (${{ matrix.backend }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # What a contributor runs locally: hermetic, no services.
+          - backend: sqlite
+            test_database_url: ""
+          # What production actually is. Unlocks the PostgreSQL-only specs.
+          - backend: postgres
+            test_database_url: postgresql+psycopg://tenderbase:tenderbase@127.0.0.1:5432/tenderbase_test
+
+    services:
+      # Both services start for both matrix legs. Redis is cheap and the queue
+      # tests are dialect-agnostic, so there is no reason to skip them on the
+      # SQLite leg as well.
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: tenderbase
+          POSTGRES_PASSWORD: tenderbase
+          POSTGRES_DB: tenderbase_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tenderbase -d tenderbase_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      TEST_DATABASE_URL: ${{ matrix.test_database_url }}
+      REDIS_URL: redis://127.0.0.1:6379/0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # conftest creates a throwaway schema per session and runs the real
+      # migration chain inside it, but CREATE EXTENSION is database-wide and
+      # needs privileges the schema does not confer. Doing it once up front
+      # keeps the migration itself honest (it still runs IF NOT EXISTS).
+      - name: Enable pg_trgm
+        if: matrix.backend == 'postgres'
+        run: |
+          PGPASSWORD=tenderbase psql -h 127.0.0.1 -U tenderbase -d tenderbase_test \
+            -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS pg_trgm"
+
+      - name: pytest
+        shell: bash
+        run: |
+          set -o pipefail
+          pytest -q -rs --durations=10 2>&1 | tee /tmp/pytest.log
+
+      # A skip in the PostgreSQL leg means a service-gated test silently did not
+      # run — which would defeat the entire point of this job. Fail loudly
+      # rather than shipping a green tick that proved nothing.
+      - name: Assert no service-gated skips
+        if: matrix.backend == 'postgres'
+        run: |
+          if grep -qE "SKIPPED.*(TEST_DATABASE_URL|REDIS_URL)" /tmp/pytest.log; then
+            echo "::error::PostgreSQL/Redis-gated tests were skipped despite both services being up."
+            grep -E "SKIPPED.*(TEST_DATABASE_URL|REDIS_URL)" /tmp/pytest.log
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  migrations:
+    name: Migrations
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: tenderbase
+          POSTGRES_PASSWORD: tenderbase
+          POSTGRES_DB: tenderbase
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tenderbase -d tenderbase"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      DATABASE_URL: postgresql+psycopg://tenderbase:tenderbase@127.0.0.1:5432/tenderbase
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Enable pg_trgm
+        run: |
+          PGPASSWORD=tenderbase psql -h 127.0.0.1 -U tenderbase -d tenderbase \
+            -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS pg_trgm"
+
+      - name: alembic upgrade head
+        run: alembic upgrade head
+
+      # Models and migrations drifting apart is the classic way a deploy dies.
+      - name: alembic check (no undeclared model drift)
+        run: alembic check
+
+      # Downgrades are only real if they are exercised. Round-trip the chain.
+      - name: Downgrade to base and re-upgrade
+        run: |
+          alembic downgrade base
+          alembic upgrade head
+
+  # ---------------------------------------------------------------------------
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: false
+          load: true
+          tags: tenderbase-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Building proves the layers 
