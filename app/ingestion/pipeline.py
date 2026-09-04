@@ -143,7 +143,17 @@ class IngestionPipeline:
             async for item in parse_source(connector, context, errors=stats.errors):
                 stats.items_found += 1
                 try:
-                    await self._process_item(session, source, context, item, run, stats)
+                    # Each item runs inside a SAVEPOINT. Catching the exception is
+                    # not enough on its own: a failed INSERT (for example a
+                    # UNIQUE violation on ``fingerprint``, which the dedup layers
+                    # deliberately allow for two genuinely different tenders that
+                    # share a title, buyer, closing date and type) poisons the
+                    # whole transaction, and every subsequent statement fails with
+                    # "this Session's transaction has been rolled back". Without
+                    # the savepoint one bad record aborts the entire run and
+                    # discards every page already collected.
+                    async with session.begin_nested():
+                        await self._process_item(session, source, context, item, run, stats)
                 except Exception as exc:  # noqa: BLE001 - isolate per-item failures
                     stats.items_failed += 1
                     stats.errors.append(
