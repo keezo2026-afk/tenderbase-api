@@ -1,0 +1,114 @@
+{
+  "uri": "https://ocds-api.etenders.gov.za/api/OCDSReleases?PageNumber=1&PageSize=2",
+  "version": "1.1",
+  "publishedDate": "2026-09-03T16:21:03Z",
+  "publisher": {
+    "name": "National Treasury (South Africa)",
+    "uri": "https://data.etenders.gov.za/"
+  },
+  "license": "https://opendatacommons.org/licenses/pddl/1-0/111",
+  "publicationPolicy": "https://data.etenders.gov.za//Home/LearnMore",
+  "releases": [
+    {
+      "ocid": "ocds-9t57fa-168797",
+      "id": "ocds-9t57fa-168797-2026-09-03",
+      "date": "2026-09-03T00:00:00Z",
+      "tag": ["compiled"],
+      "initiationType": "tender",
+      "tender": {
+        "id": "168797",
+        "title": "RFQ0001253",
+        "status": "planning",
+        "category": "Manufacture of motor vehicles, trailers and semi-trailers",
+        "province": "Western Cape",
+        "deliveryLocation": "ARNISTON PROCLAIMED FISHING, HAWE WEG - ARNISTON - 7280",
+        "specialConditions": "N/A",
+        "mainProcurementCategory": "goods",
+        "additionalProcurementCategories": ["goods"],
+        "description": "TO APPOINT A SERVICE PROVIDER (SP) TO SUPPLY THE DEPARTMENT OF FORESTRY, FISHERIES AND THE ENVIRONMENT (DFFE) WITH A NEW 1.5 TON FRONT LOADER TRACTOR.",
+        "value": { "amount": 0, "currency": "ZAR" },
+        "documents": [
+          {
+            "id": "fe341955-803b-4f2b-8c6d-f182b332c84f",
+            "documentType": "basic",
+            "title": "PFHM-329-009-2026-2027.pdf",
+            "description": "PFHM-329-009-2026-2027.pdf",
+            "url": "https://www.etenders.gov.za/home/Download?blobName=fe341955-803b-4f2b-8c6d-f182b332c84f.pdf&downloadedFileName=PFHM-329-009-2026-2027.pdf",
+            "datePublished": "2026-09-02T21:41:42Z",
+            "dateModified": "2026-09-02T21:41:42Z",
+            "format": "pdf",
+            "language": "en"
+          }
+        ],
+        "tenderPeriod": {
+          "startDate": "2026-09-03T00:00:00Z",
+          "endDate": "2026-09-14T11:00:00Z"
+        },
+        "tenderers": [],
+        "procuringEntity": { "id": "804", "name": "Marine Living Resources Fund" },
+        "procurementMethod": "open",
+        "procurementMethodDetails": "Request for Quotation",
+        "briefingSession": {
+          "isSession": false,
+          "compulsory": false,
+          "date": "0001-01-01T00:00:00Z",
+          "venue": "N/A"
+        },
+        "contactPerson": {
+          "name": "Pinky Moloi",
+          "email": "Pmoloi@dffe.gov.za",
+          "telephoneNumber": "066-471-1335"
+        }
+      },
+      "planning": { "rationale": "", "budget": { "description": " - " }, "documents": [] },
+      "parties": [],
+      "buyer": { "id": "804", "name": "Marine Living Resources Fund" },
+      "language": "en-za",
+      "awards": [],
+      "contracts": []
+    },
+    {
+      "ocid": "ocds-9t57fa-168800",
+      "id": "ocds-9t57fa-168800-2026-09-03",
+      "date": "2026-09-03T00:00:00Z",
+      "tag": ["compiled"],
+      "initiationType": "tender",
+      "tender": {
+        "id": "168800",
+        "title": "SCMU3-26/27-0042",
+        "status": "active",
+        "province": "KwaZulu-Natal",
+        "mainProcurementCategory": "works",
+        "description": "CONSTRUCTION OF A STORMWATER DRAINAGE SYSTEM.",
+        "value": { "amount": 4500000, "currency": "ZAR" },
+        "documents": [],
+        "tenderPeriod": {
+          "startDate": "2026-09-03T00:00:00Z",
+          "endDate": "2026-09-30T11:00:00Z"
+        },
+        "procuringEntity": { "id": "112", "name": "eThekwini Metropolitan Municipality" },
+        "procurementMethod": "open",
+        "procurementMethodDetails": "Open Tender",
+        "briefingSession": {
+          "isSession": true,
+          "compulsory": true,
+          "date": "2026-09-12T10:00:00Z",
+          "venue": "Council Chambers, 166 KE Masinga Road, Durban"
+        },
+        "contactPerson": {
+          "name": "S Ndlovu",
+          "email": "scm@durban.gov.za",
+          "telephoneNumber": "031-311-1111"
+        }
+      },
+      "parties": [],
+      "buyer": { "id": "112", "name": "eThekwini Metropolitan Municipality" },
+      "language": "en-za",
+      "awards": [],
+      "contracts": []
+    }
+  ],
+  "links": {
+    "next": "https://ocds-api.etenders.gov.za/api/OCDSReleases?PageNumber=2&PageSize=2"
+  }
+}

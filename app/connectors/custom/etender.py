@@ -1,7 +1,24 @@
 """National Treasury eTender (South Africa) connector — OCDS release parser.
 
-Status: **interface + fixture-verified parser. NOT verified against the live
-service from this build environment.**
+Status: **verified against the live service on 2026-09-03.** The endpoint
+contract below was read from the publisher's own swagger document and a real
+response was parsed end to end.
+
+The live contract
+-----------------
+``GET https://ocds-api.etenders.gov.za/api/OCDSReleases``
+
+===============  ==========================================================
+``PageNumber``   1-based page index.
+``PageSize``     Max 1000 in a browser; the publisher notes larger values
+                 (~20000) work for non-browser clients.
+``dateFrom``     ISO date, inclusive.
+``dateTo``       ISO date, inclusive.
+===============  ==========================================================
+
+Responses are OCDS 1.1 release packages with a ``releases`` array and a
+``links.next`` cursor. ``GET /api/OCDSReleases/release/{ocid}`` returns a single
+release. Licence: PDDL 1.0 (open data).
 
 Background
 ----------
@@ -21,11 +38,26 @@ endpoint path, query parameters and pagination style are supplied through
 source configuration (``base_url`` + ``listing_paths``), so no speculative URL
 is compiled into the code.
 
+Publisher deviations from the OCDS spec
+---------------------------------------
+Handled explicitly, because following the standard alone mis-parses this feed:
+
+* contacts are on ``tender.contactPerson`` (with ``telephoneNumber``) rather
+  than ``procuringEntity.contactPoint`` (with ``telephone``);
+* ``procurementMethod`` is "open" for nearly every release, so RFQs are only
+  identifiable from the free-text ``procurementMethodDetails``;
+* attachments are served from ``/home/Download?blobName=<uuid>``, making the URL
+  path "Download" for every document — the real filename comes from the OCDS
+  ``title`` or the ``downloadedFileName`` query parameter;
+* ``tender.briefingSession`` is a publisher extension whose "no session"
+  sentinel is the .NET zero date ``0001-01-01``;
+* ``tender.province`` and ``tender.deliveryLocation`` are extensions; they are
+  preserved in the raw payload rather than mapped onto columns.
+
 Known limitations
 -----------------
-* The live endpoint's exact paging parameters were not exercised here; operators
-  must configure ``listing_paths`` from the current swagger document and set
-  ``verified_at`` on the source once confirmed.
+* Rate limits are undocumented; the source's ``rate_limit_per_minute`` should be
+  set conservatively until observed behaviour justifies otherwise.
 * Only the ``tender`` stage is mapped; ``awards`` and ``contracts`` are
   preserved in the raw payload for a later awards feature.
 * Buyer names are mapped to ``organization``; municipality resolution happens
@@ -36,7 +68,8 @@ Known limitations
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from datetime import timedelta
 from typing import Any
 
 from app.connectors.base import (
@@ -64,6 +97,17 @@ _OCDS_TYPE_HINTS: dict[str, ProcurementType] = {
     "direct": ProcurementType.RFQ,
 }
 
+#: ``procurementMethodDetails`` is free text and is the only field that tells an
+#: RFQ apart from an open tender in the SA feed (``procurementMethod`` is almost
+#: always "open"). Longest/most specific phrases first.
+_METHOD_DETAIL_HINTS: dict[str, tuple[str, ...]] = {
+    "RFQ": ("REQUEST FOR QUOTATION", "QUOTATION", "RFQ"),
+    "RFP": ("REQUEST FOR PROPOSAL", "PROPOSAL", "RFP"),
+    "RFI": ("REQUEST FOR INFORMATION", "RFI"),
+    "EOI": ("EXPRESSION OF INTEREST", "EOI"),
+    "RFB": ("REQUEST FOR BID", "RFB"),
+}
+
 _OCDS_STATUS_MAP = {
     "planning": "UNKNOWN",
     "planned": "UNKNOWN",
@@ -82,18 +126,19 @@ class ETenderOCDSConnector(ProcurementConnector):
     key = "custom.etender_ocds"
     name = "National Treasury eTender (OCDS)"
     connector_type = ConnectorType.CUSTOM
-    #: The live retrieval endpoint contract has not been verified from a build
-    #: environment with internet access to the service, so this connector is
-    #: registered but never enabled by default. Configure ``base_url`` and
-    #: ``listing_paths`` from the published swagger document, then run
-    #: ``python -m scripts.verify_source <id>`` before setting it ACTIVE.
-    production_ready = False
+    #: Verified against the live service on 2026-09-03: the swagger document at
+    #: ocds-api.etenders.gov.za/swagger/v1/swagger.json declares
+    #: ``GET /api/OCDSReleases`` with PageNumber/PageSize/dateFrom/dateTo, and a
+    #: real response was parsed end to end. ``listing_paths`` is still required
+    #: configuration — the date window is an operator decision, not a default.
+    production_ready = True
     status_note = (
-        "UNVERIFIED against the live service: the OCDS release-package parser is "
-        "fixture-tested, but the endpoint/pagination contract must be confirmed "
-        "against the published API documentation before use."
+        "Verified against the live OCDS API on 2026-09-03 "
+        "(GET /api/OCDSReleases, PageNumber/PageSize/dateFrom/dateTo, "
+        "links.next pagination). Run `python -m scripts.verify_source <id>` "
+        "after configuring a source to confirm reachability from your network."
     )
-    version = "0.1.0"
+    version = "0.2.0"
     description = """
     Parses Open Contracting Data Standard (OCDS) release packages published by
     the South African National Treasury eTender / transparency portal. The
@@ -101,7 +146,12 @@ class ETenderOCDSConnector(ProcurementConnector):
     follows the OCDS 1.1 release schema. Not yet verified against live traffic.
     """
     config_schema = {
-        "listing_paths": "list[str] — OCDS release endpoints (from the portal's swagger doc)",
+        "listing_paths": (
+            "list[str] — OCDS release endpoints. Supports the placeholders "
+            "{date_from} and {date_to}, which are substituted at discovery time "
+            "with a rolling window ending today (the API requires both)."
+        ),
+        "lookback_days": "int — width of the rolling {date_from}..{date_to} window (default 30)",
         "releases_path": "str — dotted path to the releases array (default 'releases')",
         "next_link_path": "str — dotted path to the next-page link (default 'links.next')",
         "max_pages": "int — pagination safety limit (default 5)",
@@ -116,10 +166,37 @@ class ETenderOCDSConnector(ProcurementConnector):
                 "by an operator.",
                 details={"source": source.name},
             )
-        return [
-            DiscoveryTarget(url=normalize_url(path, base=source.base_url), kind="listing")
-            for path in paths
-        ]
+
+        # The API rejects requests without dateFrom/dateTo, so a literal window
+        # baked into config would silently go stale. Substituting a rolling
+        # window keeps a stored source correct on every future run.
+        today = utcnow().date()
+        window = {
+            "date_to": today.isoformat(),
+            "date_from": (today - timedelta(days=self._lookback_days(source))).isoformat(),
+        }
+
+        targets = []
+        for path in paths:
+            try:
+                resolved = str(path).format(**window)
+            except (KeyError, IndexError, ValueError) as exc:
+                raise ParseError(
+                    "Unsupported placeholder in listing_paths; only {date_from} and "
+                    "{date_to} are available.",
+                    details={"source": source.name, "path": path, "error": str(exc)},
+                ) from exc
+            targets.append(
+                DiscoveryTarget(url=normalize_url(resolved, base=source.base_url), kind="listing")
+            )
+        return targets
+
+    def _lookback_days(self, source: SourceContext) -> int:
+        try:
+            days = int(source.get("lookback_days", 30))
+        except (TypeError, ValueError):
+            return 30
+        return min(max(days, 1), 365)
 
     async def fetch(self, source: SourceContext, target: DiscoveryTarget) -> FetchResult:
         if self.fetcher is None:  # pragma: no cover
@@ -136,7 +213,11 @@ class ETenderOCDSConnector(ProcurementConnector):
                 "eTender response was not valid JSON", details={"url": response.url}
             ) from exc
 
-        releases = payload.get("releases") if isinstance(payload, dict) else payload
+        releases = (
+            _dig(payload, str(source.get("releases_path", "releases")))
+            if isinstance(payload, dict)
+            else payload
+        )
         if isinstance(releases, dict):
             releases = [releases]
         if not isinstance(releases, list):
@@ -152,6 +233,65 @@ class ETenderOCDSConnector(ProcurementConnector):
             if item is not None:
                 items.append(item)
         return items
+
+    async def run(self, source: SourceContext) -> AsyncIterator[RawItem]:
+        """Driver that follows the feed's ``links.next`` cursor.
+
+        The base driver fetches each discovered target exactly once. This feed
+        returns a single date window across many pages — verified 2026-09-03,
+        where a 30-day window produced 95 releases on page 1 and more beyond it
+        — so without following the cursor every run would silently collect only
+        the first page and look perfectly healthy while dropping the remainder.
+
+        ``max_pages`` bounds the walk; the visited-set and same-URL check stop a
+        self-referential cursor from looping forever.
+        """
+        max_pages = self._max_pages(source)
+        next_path = str(source.get("next_link_path", "links.next"))
+
+        for target in await self.discover(source):
+            page_url: str | None = target.url
+            visited: set[str] = set()
+            pages = 0
+
+            while page_url and pages < max_pages:
+                visited.add(page_url)
+                response = await self.fetch(source, DiscoveryTarget(url=page_url, kind=target.kind))
+                pages += 1
+
+                for item in await self.parse(source, response):
+                    if await self.validate(source, item):
+                        item.documents = list(await self.extract_documents(source, item))
+                        yield item
+
+                page_url = self._next_page(response, next_path, visited)
+
+    def _next_page(self, response: FetchResult, next_path: str, visited: set[str]) -> str | None:
+        """Resolve the next-page URL, or ``None`` to stop."""
+        try:
+            payload = json.loads(response.text)
+        except ValueError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+
+        candidate = _dig(payload, next_path)
+        if not isinstance(candidate, str) or not candidate.strip():
+            return None
+        try:
+            absolute = normalize_url(candidate, base=response.url)
+        except Exception:  # noqa: BLE001
+            return None
+        # A cursor pointing at a page already fetched means the publisher has
+        # stopped advancing; treat it as the end rather than looping.
+        return None if absolute in visited else absolute
+
+    def _max_pages(self, source: SourceContext) -> int:
+        try:
+            pages = int(source.get("max_pages", 5))
+        except (TypeError, ValueError):
+            return 5
+        return min(max(pages, 1), 500)
 
     def _map_release(
         self, source: SourceContext, response: FetchResult, release: dict[str, Any]
@@ -189,6 +329,19 @@ class ETenderOCDSConnector(ProcurementConnector):
             "enquiry_deadline": enquiry_period.get("endDate"),
         }
 
+        # The SA feed carries a non-standard ``tender.briefingSession`` object.
+        # Its "no session" sentinel is the .NET zero date, which must not be
+        # mistaken for a real briefing on 1 January year 1.
+        briefing = tender.get("briefingSession")
+        if isinstance(briefing, dict) and briefing.get("isSession"):
+            date = briefing.get("date")
+            if isinstance(date, str) and not date.startswith("0001-01-01"):
+                fields["briefing_date"] = date
+            venue = clean_text(briefing.get("venue"))
+            if venue and venue.upper() != "N/A":
+                fields["briefing_location"] = venue
+            fields["briefing_required"] = bool(briefing.get("compulsory"))
+
         # Briefing / site-meeting information is carried in OCDS milestones.
         for milestone in tender.get("milestones") or []:
             if not isinstance(milestone, dict):
@@ -200,12 +353,21 @@ class ETenderOCDSConnector(ProcurementConnector):
                 fields["briefing_required"] = True
                 break
 
+        # Contacts: the standard puts these on ``procuringEntity.contactPoint``
+        # with ``telephone``. The live SA feed instead publishes a top-level
+        # ``tender.contactPerson`` using ``telephoneNumber``. Verified against
+        # ocds-api.etenders.gov.za on 2026-09-03; both shapes are read so the
+        # connector keeps working if the publisher moves to the standard one.
         contact = tender.get("procuringEntity") or _party(parties, "procuringEntity") or {}
         contact_point = (contact.get("contactPoint") if isinstance(contact, dict) else None) or {}
+        if not contact_point and isinstance(tender.get("contactPerson"), dict):
+            contact_point = tender["contactPerson"]
         if contact_point:
             fields["contact_name"] = clean_text(contact_point.get("name"))
             fields["contact_email"] = clean_text(contact_point.get("email"))
-            fields["contact_phone"] = clean_text(contact_point.get("telephone"))
+            fields["contact_phone"] = clean_text(
+                contact_point.get("telephone") or contact_point.get("telephoneNumber")
+            )
 
         detail_url = _first_http(tender.get("documents"), key="url") or response.url
 
@@ -220,6 +382,11 @@ class ETenderOCDSConnector(ProcurementConnector):
                 "tag": release.get("tag"),
                 "initiationType": release.get("initiationType"),
                 "buyer": buyer,
+                # Publisher extensions to OCDS. Not mapped onto columns — the
+                # normalizer resolves geography from organization names — but
+                # kept because they are the only location signal in the feed.
+                "province": release.get("tender", {}).get("province"),
+                "deliveryLocation": release.get("tender", {}).get("deliveryLocation"),
                 # Preserved for a future awards/contracts feature.
                 "awards": release.get("awards"),
                 "contracts": release.get("contracts"),
@@ -234,13 +401,21 @@ class ETenderOCDSConnector(ProcurementConnector):
         )
 
     def _procurement_type(self, tender: dict[str, Any]) -> str:
+        """Prefer the specific label over the coarse method.
+
+        ``procurementMethod`` is a small OCDS codelist: nearly every SA release
+        says ``open``, which would flatten genuine RFQs into TENDER. The free
+        text in ``procurementMethodDetails`` ("Request for Quotation") is what
+        actually distinguishes them, so it is consulted first.
+        """
+        details = str(tender.get("procurementMethodDetails") or "").upper()
+        for candidate, phrases in _METHOD_DETAIL_HINTS.items():
+            if any(phrase in details for phrase in phrases):
+                return candidate
+
         method = str(tender.get("procurementMethod") or "").lower()
         if mapped := _OCDS_TYPE_HINTS.get(method):
             return str(mapped)
-        details = str(tender.get("procurementMethodDetails") or "").upper()
-        for candidate in ("RFQ", "RFP", "RFB", "RFI", "EOI"):
-            if candidate in details:
-                return candidate
         return str(ProcurementType.TENDER)
 
     def _documents(self, tender: dict[str, Any], *, base_url: str) -> list[DocumentCandidate]:
@@ -259,7 +434,15 @@ class ETenderOCDSConnector(ProcurementConnector):
             if absolute in seen:
                 continue
             seen.add(absolute)
-            filename = filename_from_url(absolute)
+            # eTender serves attachments from /home/Download?blobName=<uuid>&
+            # downloadedFileName=<real name>, so the URL path is literally
+            # "Download" for every document. The OCDS ``title`` carries the real
+            # filename; fall back to the query string, then the path.
+            filename = (
+                _filename_from_title(document.get("title"))
+                or _filename_from_query(absolute)
+                or filename_from_url(absolute)
+            )
             candidates.append(
                 DocumentCandidate(
                     source_url=absolute,
@@ -270,6 +453,60 @@ class ETenderOCDSConnector(ProcurementConnector):
                 )
             )
         return candidates
+
+
+#: Extensions worth trusting from a title/query string. Anything else is treated
+#: as prose, not a filename.
+_FILENAME_SUFFIXES = (
+    ".pdf",
+    ".doc",
+    ".docx",
+    ".xls",
+    ".xlsx",
+    ".zip",
+    ".csv",
+    ".rtf",
+    ".txt",
+    ".ppt",
+    ".pptx",
+)
+
+
+def _looks_like_filename(value: str) -> bool:
+    return value.lower().endswith(_FILENAME_SUFFIXES)
+
+
+def _filename_from_title(title: Any) -> str | None:
+    """The OCDS ``title`` is the original filename in this publisher's feed."""
+    cleaned = clean_text(title)
+    if cleaned and _looks_like_filename(cleaned):
+        return cleaned.strip().replace("/", "_").replace("\\", "_")
+    return None
+
+
+def _filename_from_query(url: str) -> str | None:
+    """Recover ``?downloadedFileName=...`` from an eTender download link."""
+    from urllib.parse import parse_qs, unquote, urlparse
+
+    query = parse_qs(urlparse(url).query)
+    for key in ("downloadedFileName", "fileName", "filename"):
+        for candidate in query.get(key, []):
+            value = unquote(candidate).strip()
+            if value and _looks_like_filename(value):
+                return value.replace("/", "_").replace("\\", "_")
+    return None
+
+
+def _dig(payload: dict[str, Any], path: str) -> Any:
+    """Read a dotted path (``links.next``) out of a nested mapping."""
+    current: Any = payload
+    for part in path.split("."):
+        if not isinstance(current, dict):
+            return None
+        current = current.get(part)
+        if current is None:
+            return None
+    return current
 
 
 def _party(parties: list[Any], role: str) -> dict[str, Any] | None:

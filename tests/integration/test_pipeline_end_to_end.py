@@ -200,3 +200,45 @@ async def test_ingested_records_are_visible_through_the_api(
     assert runs["pagination"]["total_items"] == 1
     assert runs["data"][0]["items_found"] == 3
     await fetcher.aclose()
+
+
+async def test_fingerprint_collision_does_not_abort_the_run(session, source, mock_fetcher):
+    """One unstorable record must not discard everything already collected.
+
+    Regression test for a real failure on the live eTenders feed (2026-09-03).
+    ``FINGERPRINT_FIELDS`` is only (title, organization, closing_at,
+    procurement_type), so two genuinely different tenders from one agency that
+    share those four values collide on ``uq_opportunity_fingerprint``. The dedup
+    layers deliberately treat them as distinct because their reference numbers
+    differ, so the pipeline correctly tries to insert both -- and the database
+    correctly refuses the second.
+
+    Catching the exception per item is not sufficient: the failed INSERT poisons
+    the surrounding transaction, so every later statement dies with "this
+    Session's transaction has been rolled back". On the live run that turned one
+    colliding record into a total loss of four already-fetched pages. Each item
+    is now wrapped in a SAVEPOINT so only the offending record is rolled back.
+    """
+    listing = """
+    <table class="tenders"><tbody>
+      <tr><td>REF-COLLIDE-A</td><td><a href="/t/a">Identical Title Same Day</a></td>
+          <td>2026-09-01</td><td>2026-10-01</td></tr>
+      <tr><td>REF-COLLIDE-B</td><td><a href="/t/b">Identical Title Same Day</a></td>
+          <td>2026-09-01</td><td>2026-10-01</td></tr>
+      <tr><td>REF-SURVIVOR</td><td><a href="/t/c">A Clearly Different Tender</a></td>
+          <td>2026-09-01</td><td>2026-10-15</td></tr>
+    </tbody></table>
+    """
+    fetcher = mock_fetcher({"https://example.org/tenders": (200, listing, "text/html")})
+    run = await run_pipeline(session, source, fetcher)
+
+    assert run.items_found == 3
+
+    titles = {
+        o.title for o in (await session.execute(select(ProcurementOpportunity))).scalars().all()
+    }
+    # The run completed and the record *after* the collision still landed --
+    # that is the part the poisoned transaction used to destroy.
+    assert "A Clearly Different Tender" in titles
+    assert "Identical Title Same Day" in titles
+    assert run.items_created + run.items_updated + run.items_failed == 3

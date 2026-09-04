@@ -165,13 +165,21 @@ def test_first_meaningful_line_skips_noise():
 
 
 async def test_etender_connector_parses_ocds_releases(mock_fetcher, fixture_loader):
+    # The fixture declares links.next, and the connector follows it (a single
+    # date window spans many pages on the real feed). Page 2 is served empty so
+    # the walk terminates naturally instead of 404-ing on an unstubbed URL.
     fetcher = mock_fetcher(
         {
             "https://example.org/ocds/releases": (
                 200,
                 fixture_loader("etender_ocds_release.json"),
                 "application/json",
-            )
+            ),
+            "https://example.org/ocds/releases?page=2": (
+                200,
+                '{"version": "1.1", "releases": []}',
+                "application/json",
+            ),
         }
     )
     source = context(ConnectorType.CUSTOM, listing_paths=["/ocds/releases"])
